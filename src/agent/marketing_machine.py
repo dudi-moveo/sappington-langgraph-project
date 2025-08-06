@@ -1,4 +1,6 @@
-from typing import Annotated, Optional, Literal, TypedDict
+from typing_extensions import Annotated, Optional, Literal, TypedDict
+import logging
+import os
 from langgraph.graph import StateGraph, END, START
 from langgraph.graph.message import add_messages
 from langchain_core.messages import AIMessage, HumanMessage, AnyMessage
@@ -12,9 +14,27 @@ from agent.content_engine import ContentEngineSubgraph
 from agent.PROMPTS import QuestionAnsweringPrompt, QuestionAnsweringContext, ImplicitRoutingContext, ClassifyInputPrompt
 
 # --------------------
+# Logger Setup
+# --------------------
+logger = logging.getLogger(__name__)
+
+# Get log level from environment variable, default to INFO
+log_level = os.getenv('LOG_LEVEL', 'INFO').upper()
+
+logging.basicConfig(
+    level=getattr(logging, log_level),
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.StreamHandler(),  # Console output
+        logging.FileHandler('app.log')  # File output
+    ]
+)
+
+# --------------------
 # LLM Definition
 # --------------------
 llm = init_chat_model(model="openai:gpt-4o")
+logger.info("Initialized LLM with model: openai:gpt-4o")
 
 
 
@@ -27,6 +47,7 @@ class RouterState(TypedDict):
     engine_suggestion: Optional[str]
     confirmation_given: Optional[bool]
     confirmation_message_for_implicit: Optional[str]
+    chosen_engine: Optional[Literal["MessagingEngine", "CompetitiveAnalysis", "MarketingResearch", "ContentEngine"]]
 
 
 engine_list = ["MessagingEngine", "CompetitiveAnalysis", "MarketingResearch", "ContentEngine"]
@@ -51,8 +72,9 @@ class RoutingOutput(BaseModel):
 # Node Implementations
 # --------------------
 def classify_input(state: RouterState) -> RouterState:
-    #last_user_msg = next((m.content for m in reversed(state["messages"]) if m.type == "human"), "")
-    print("**********")
+    """Classify user input and determine routing strategy."""
+    logger.info("Starting input classification")
+    logger.debug("Current state messages count: %d", len(state["messages"]))
     
     # Get conversation context (exclude the current message)
     if len(state["messages"]) > 1:
@@ -60,8 +82,10 @@ def classify_input(state: RouterState) -> RouterState:
         context_messages = state["messages"][-3:-1] if len(state["messages"]) >= 3 else state["messages"][:-1]
         context_text = "\n".join([f"{msg.type}: {msg.content}" for msg in context_messages])
         context_section = f"Previous conversation context:\n{context_text}\n"
+        logger.debug("Using conversation context from %d previous messages", len(context_messages))
     else:
         context_section = ""
+        logger.debug("No previous conversation context available")
 
     prompt_with_user_message = ClassifyInputPrompt.format(
         engine_list=engine_list,
@@ -69,36 +93,43 @@ def classify_input(state: RouterState) -> RouterState:
         examples=ImplicitRoutingContext,
         context_section=context_section
     )
-    print("********** Prompt with User Message **********")
-    print(prompt_with_user_message)
+    logger.debug("Generated classification prompt")
+    logger.debug("User message: %s", state["messages"][-1].content)
+    
     llm_with_schema = llm.with_structured_output(schema=RoutingOutput)
     llm_response = llm_with_schema.invoke(prompt_with_user_message)
-    print("********** LLM Response **********")
-    print(llm_response)
+    logger.debug("LLM classification response: %s", llm_response)
+    
     if llm_response.routing_type == "greeting":
-        print("********** Greeting **********")
+        logger.info("Classified as greeting, responding with greeting message")
         return {**state, "routing_type": llm_response.routing_type, "messages": AIMessage(content=llm_response.greeting_message) }
     else:
-        print("********** Not Greeting **********")
+        logger.info("Classified as: %s, suggested engine: %s", llm_response.routing_type, llm_response.engine_suggestion)
         return {**state, "routing_type": llm_response.routing_type, "engine_suggestion": llm_response.engine_suggestion, "confirmation_message_for_implicit": llm_response.confirmation_message_for_implicit}
 
 def direct_router(state: RouterState) -> RouterState:
+    """Route directly to the suggested engine."""
     engine = state.get("engine_suggestion", "UnknownEngine")
-    print(f"Routing directly to engine: {engine}")
+    logger.info("Routing directly to engine: %s", engine)
+    
+    if engine == "UnknownEngine":
+        logger.warning("No engine suggestion found in state, using UnknownEngine")
+    
     return state
 
 def ask_for_confirmation(state: RouterState) -> RouterState:
+    """Ask user for confirmation before routing to suggested engine."""
     engine = state.get("engine_suggestion", "some engine")
     user_confirmation_message = state.get("confirmation_message_for_implicit", f"Just to confirm, do you want to proceed with {engine}?")
-    print("********** User Confirmation Message **********")
-    print(user_confirmation_message)
+    logger.info("Requesting user confirmation for engine: %s", engine)
+    logger.debug("Confirmation message: %s", user_confirmation_message)
     
     # Get user response
     user_response = interrupt({
         "question": user_confirmation_message,
     })
-    print("********** User Response **********")
-    print(user_response)
+    logger.info("Received user response for confirmation")
+    logger.debug("User response: %s", user_response)
     
     # Use LLM to process the approval with structured output
     last_messages = state["messages"][-2:] if len(state["messages"]) >= 2 else state["messages"]
@@ -117,14 +148,13 @@ def ask_for_confirmation(state: RouterState) -> RouterState:
     - follow_up_message: if not approved, provide a helpful message asking what they'd like to do instead
     """
     
+    logger.debug("Processing approval with LLM")
     llm_with_approval_schema = llm.with_structured_output(schema=ApprovalResponse)
     approval_result = llm_with_approval_schema.invoke(approval_prompt)
-    
-    print("********** Approval Result **********")
-    print(approval_result)
+    logger.debug("Approval analysis result: %s", approval_result)
     
     if approval_result.approved:
-        print("********** Approved **********")
+        logger.info("User approved routing to %s", engine)
         # Add user's approval to the conversation history
         updated_state = {
             **state, 
@@ -132,8 +162,9 @@ def ask_for_confirmation(state: RouterState) -> RouterState:
         }
         return Command(goto="DirectRouter", update=updated_state)
     else:
-        print("********** Not Approved **********")
+        logger.info("User did not approve routing, providing follow-up")
         follow_up = approval_result.follow_up_message or "I understand you'd like to do something different. What would you like to accomplish today?"
+        logger.debug("Follow-up message: %s", follow_up)
         return {
             **state, 
             "messages": state["messages"] + [
@@ -143,21 +174,42 @@ def ask_for_confirmation(state: RouterState) -> RouterState:
         }
 
 def answer_system_question(state: RouterState) -> RouterState:
-    #qa_prompt = QuestionAnsweringPrompt.format(question=state["messages"][-1].content[0]['text'])
+    """Answer questions about the system using predefined context."""
     user_question = state["messages"][-1].content
+    logger.info("Answering system question")
+    logger.debug("User question: %s", user_question)
+    
     qna_prompt = QuestionAnsweringPrompt.format(context=QuestionAnsweringContext, question=user_question)
-    print("********** QA Prompt **********")
-    print(user_question)
-    print(qna_prompt)
+    logger.debug("Generated QA prompt")
+    
     llm_response = llm.invoke(qna_prompt)
-    print("********** QA LLM Response **********")
-    print(llm_response)
+    logger.debug("QA LLM response: %s", llm_response.content)
+    logger.info("Successfully generated answer for system question")
+    
     state["messages"].append(AIMessage(content=llm_response.content))
     return state
 
 def reject_irrelevant(state: RouterState) -> RouterState:
-    state["messages"].append(AIMessage(content="Sorry, I can't help with that. Please tell me what you want to do today, click a button to get started, or ask a relevant question to get started."))
+    """Reject irrelevant requests with a helpful message."""
+    logger.info("Rejecting irrelevant request")
+    logger.debug("Last message was classified as irrelevant: %s", state["messages"][-1].content)
+    
+    rejection_message = "Sorry, I can't help with that. Please tell me what you want to do today, click a button to get started, or ask a relevant question to get started."
+    state["messages"].append(AIMessage(content=rejection_message))
     return state
+
+def route_directly_based_on_prior_choice(state: RouterState) -> RouterState:
+    """Route directly to the suggested engine."""
+    chosen_engine = state.get("chosen_engine", "UnknownEngine")
+    if chosen_engine == "ContentEngine":
+        return Command(goto="ContentEngine", update=state)
+    elif chosen_engine == "MessagingEngine":
+        return Command(goto="MessagingEngine", update=state)
+    elif chosen_engine == "CompetitiveAnalysis":
+        return Command(goto="CompetitiveAnalysis", update=state)
+    elif chosen_engine == "MarketingResearch":
+        return Command(goto="MarketingResearch", update=state)
+
 
 # --------------------
 # Graph Definition
@@ -168,17 +220,21 @@ builder.add_node("DirectRouter", direct_router)
 builder.add_node("UserConfirmation", ask_for_confirmation)
 builder.add_node("AnswerSystemQuestion", answer_system_question)
 builder.add_node("RejectIrrelevant", reject_irrelevant)
+builder.add_node("RouteDirectlyBasedOnPriorChoice", route_directly_based_on_prior_choice)
 
 # --------------------
 # Subgraphs
 # --------------------
+logger.info("Setting up subgraphs")
 builder.add_node("MessagingEngine", MessagingEngineSubgraph)
 builder.add_node("CompetitiveAnalysis", CompetitiveAnalysisSubgraph)
 builder.add_node("MarketingResearch", MarketingResearchSubgraph)
 builder.add_node("ContentEngine", ContentEngineSubgraph)
 
 # Edges
-builder.set_entry_point("ClassifyInput")
+logger.info("Configuring graph edges and entry point")
+builder.set_entry_point("RouteDirectlyBasedOnPriorChoice")
+builder.add_edge("RouteDirectlyBasedOnPriorChoice", "ClassifyInput")
 
 builder.add_conditional_edges(
     "ClassifyInput",
@@ -210,3 +266,4 @@ builder.add_edge("DirectRouter", END)
 builder.add_edge("UserConfirmation", END)
 
 graph = builder.compile()
+logger.info("Marketing machine graph compiled successfully")
